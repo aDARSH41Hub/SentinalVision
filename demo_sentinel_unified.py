@@ -42,7 +42,7 @@ def draw_hud(frame: np.ndarray, result: Dict[str, Any]) -> None:
         f"Audio threat: {audio.get('threat_score', 0.0):.3f}",
         f"Vision score: {composite.get('raw_vision_score', 0.0):.3f}",
         f"Coverage: {composite.get('sensor_coverage', 0.0):.1f}",
-        f"FPS: {performance['fps']:.1f}  Vision: {performance['vision_latency_ms']:.1f}ms",
+        f"FPS: {performance['frame_fps']:.1f}  Vision: {performance['vision_latency_ms']:.1f}ms",
         f"Audio age: {performance['audio_age_ms']:.0f}ms",
     ]
 
