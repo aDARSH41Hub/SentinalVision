@@ -1,0 +1,57 @@
+@"
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# ML model weights
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# Datasets / raw media
+data/
+datasets/
+*.wav
+*.mp3
+*.mp4
+*.avi
+*.mov
+
+# Generated / experimental output
+results/
+outputs/
+logs/
+runs/
+benchmarks/
+*.csv
+
+# Backups / temporary patch copies
+backup_*/
+SentinelVision_Stabilization_Patch/
+
+# IDE
+.vscode/
+.idea/
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+"@ | Set-Content .gitignore
