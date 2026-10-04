@@ -1,4 +1,3 @@
-@"
 # Python
 __pycache__/
 *.py[cod]
@@ -38,6 +37,9 @@ runs/
 benchmarks/
 *.csv
 
+# Archives / large artifacts
+*.zip
+
 # Backups / temporary patch copies
 backup_*/
 SentinelVision_Stabilization_Patch/
@@ -54,4 +56,3 @@ SentinelVision_Stabilization_Patch/
 # OS
 .DS_Store
 Thumbs.db
-"@ | Set-Content .gitignore
