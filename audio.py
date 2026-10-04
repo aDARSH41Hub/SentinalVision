@@ -18,10 +18,13 @@ logger = logging.getLogger(__name__)
 
 class AudioDetectorConfig:
     MODEL_NAME: str = "MIT/ast-finetuned-audioset-10-10-0.4593"
+
     SAMPLE_RATE: int = 16000
     BUFFER_SECONDS: int = 2
+
     MIC_DEVICE: int = 0
     BLOCKSIZE: int = 1600
+
     INFERENCE_INTERVAL_SECONDS: float = 1.0
     SILENCE_THRESHOLD: float = 0.01
 
@@ -61,37 +64,121 @@ class AudioDetector:
     def __init__(
         self,
         config: Optional[AudioDetectorConfig] = None,
-        device: str = "cpu",
+        device: str = "auto",
         mic_device: Optional[int] = None,
     ) -> None:
         self.config = config or AudioDetectorConfig()
-        self.device = torch.device(device)
-        self.mic_device = self.config.MIC_DEVICE if mic_device is None else mic_device
+
+        # ------------------------------------------------------------
+        # Automatic device selection
+        # ------------------------------------------------------------
+        try:
+            if device == "auto":
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            self.device = torch.device(device)
+
+            if self.device.type == "cuda":
+                if not torch.cuda.is_available():
+                    logger.warning(
+                        "CUDA requested but unavailable. Falling back to CPU."
+                    )
+                    self.device = torch.device("cpu")
+                else:
+                    logger.info(
+                        "AST using GPU: %s",
+                        torch.cuda.get_device_name(self.device.index or 0),
+                    )
+            else:
+                logger.info("AST using CPU")
+
+        except Exception as exc:
+            logger.warning(
+                "Audio device initialization failed; falling back to CPU: %s",
+                exc,
+            )
+            self.device = torch.device("cpu")
+
+        self.mic_device = (
+            self.config.MIC_DEVICE
+            if mic_device is None
+            else mic_device
+        )
 
         if self.mic_device < 0:
-            raise ValueError(f"Invalid microphone device index: {self.mic_device}")
+            raise ValueError(
+                f"Invalid microphone device index: {self.mic_device}"
+            )
 
+        # ------------------------------------------------------------
+        # Load AST processor + model
+        # ------------------------------------------------------------
         try:
-            logger.info("Loading AST processor from %s", self.config.MODEL_NAME)
-            self.processor = AutoProcessor.from_pretrained(self.config.MODEL_NAME)
-            self.model = AutoModelForAudioClassification.from_pretrained(self.config.MODEL_NAME)
-            self.model.to(self.device)
-            self.model.eval()
-        except Exception as exc:
-            logger.error("Failed to load AST model: %s", exc, exc_info=True)
-            raise RuntimeError(f"Could not load AST model: {exc}") from exc
+            logger.info(
+                "Loading AST processor from %s",
+                self.config.MODEL_NAME,
+            )
 
-        self.buffer_size = int(self.config.SAMPLE_RATE * self.config.BUFFER_SECONDS)
-        self.audio_buffer = np.zeros(self.buffer_size, dtype=np.float32)
+            self.processor = AutoProcessor.from_pretrained(
+                self.config.MODEL_NAME
+            )
+
+            self.model = AutoModelForAudioClassification.from_pretrained(
+                self.config.MODEL_NAME
+            )
+
+            # Move AST model to selected device.
+            self.model.to(self.device)
+
+            # Inference mode.
+            self.model.eval()
+
+            logger.info(
+                "AST model loaded successfully on %s",
+                self.device,
+            )
+
+        except Exception as exc:
+            logger.error(
+                "Failed to load AST model: %s",
+                exc,
+                exc_info=True,
+            )
+            raise RuntimeError(
+                f"Could not load AST model: {exc}"
+            ) from exc
+
+        # ------------------------------------------------------------
+        # Audio buffer
+        # ------------------------------------------------------------
+        self.buffer_size = int(
+            self.config.SAMPLE_RATE * self.config.BUFFER_SECONDS
+        )
+
+        self.audio_buffer = np.zeros(
+            self.buffer_size,
+            dtype=np.float32,
+        )
+
         self.lock = threading.Lock()
+
         self.running = True
 
+        # ------------------------------------------------------------
+        # Health / telemetry
+        # ------------------------------------------------------------
         self.health_status = "OK"
         self.last_error: Optional[str] = None
+
         self.last_inference_ms: float = 0.0
 
-        self.last_result: Dict[str, Any] = self._create_empty_result()
+        self.last_result: Dict[str, Any] = (
+            self._create_empty_result()
+        )
 
+        # ------------------------------------------------------------
+        # Open microphone stream
+        # ------------------------------------------------------------
         try:
             self.stream = sd.InputStream(
                 samplerate=self.config.SAMPLE_RATE,
@@ -101,19 +188,40 @@ class AudioDetector:
                 blocksize=self.config.BLOCKSIZE,
                 callback=self._audio_callback,
             )
+
             self.stream.start()
+
+            logger.info(
+                "Audio stream started. Device index: %s",
+                self.mic_device,
+            )
+
         except Exception as exc:
-            logger.error("Failed to open microphone: %s", exc, exc_info=True)
+            logger.error(
+                "Failed to open microphone: %s",
+                exc,
+                exc_info=True,
+            )
+
             raise RuntimeError(
-                f"Could not open microphone device {self.mic_device}: {exc}"
+                f"Could not open microphone device "
+                f"{self.mic_device}: {exc}"
             ) from exc
 
+        # ------------------------------------------------------------
+        # Background inference thread
+        # ------------------------------------------------------------
         self.thread = threading.Thread(
             target=self._inference_loop,
             daemon=True,
             name="AudioInferenceThread",
         )
+
         self.thread.start()
+
+    # =================================================================
+    # Result helpers
+    # =================================================================
 
     def _create_empty_result(self) -> Dict[str, Any]:
         return {
@@ -129,11 +237,20 @@ class AudioDetector:
             "inference_latency_ms": 0.0,
         }
 
-    def _set_health(self, status: str, error: Optional[str] = None) -> None:
+    def _set_health(
+        self,
+        status: str,
+        error: Optional[str] = None,
+    ) -> None:
         self.health_status = status
         self.last_error = error
+
         if error:
             logger.warning(error)
+
+    # =================================================================
+    # Audio capture
+    # =================================================================
 
     def _audio_callback(
         self,
@@ -143,35 +260,66 @@ class AudioDetector:
         status: Any,
     ) -> None:
         if status:
-            self._set_health("DEGRADED", f"Audio stream status: {status}")
+            self._set_health(
+                "DEGRADED",
+                f"Audio stream status: {status}",
+            )
 
         if indata.ndim == 1:
             new_audio = indata
         else:
             new_audio = indata[:, 0]
 
-        new_audio = np.asarray(new_audio, dtype=np.float32)
+        new_audio = np.asarray(
+            new_audio,
+            dtype=np.float32,
+        )
+
         with self.lock:
             if len(new_audio) >= self.buffer_size:
-                self.audio_buffer = new_audio[-self.buffer_size:].copy()
+                self.audio_buffer = (
+                    new_audio[-self.buffer_size:].copy()
+                )
             else:
-                self.audio_buffer = np.roll(self.audio_buffer, -len(new_audio))
-                self.audio_buffer[-len(new_audio):] = new_audio
+                self.audio_buffer = np.roll(
+                    self.audio_buffer,
+                    -len(new_audio),
+                )
+
+                self.audio_buffer[-len(new_audio):] = (
+                    new_audio
+                )
+
+    # =================================================================
+    # Background inference
+    # =================================================================
 
     def _inference_loop(self) -> None:
         while self.running:
-            time.sleep(self.config.INFERENCE_INTERVAL_SECONDS)
+            time.sleep(
+                self.config.INFERENCE_INTERVAL_SECONDS
+            )
+
             with self.lock:
                 audio = self.audio_buffer.copy()
 
             if len(audio) < self.buffer_size:
                 continue
 
-            peak = float(np.max(np.abs(audio)))
-            rms = float(np.sqrt(np.mean(audio ** 2)))
+            peak = float(
+                np.max(np.abs(audio))
+            )
 
+            rms = float(
+                np.sqrt(np.mean(audio ** 2))
+            )
+
+            # --------------------------------------------------------
+            # Silence fast path
+            # --------------------------------------------------------
             if peak < self.config.SILENCE_THRESHOLD:
                 timestamp = time.time()
+
                 with self.lock:
                     self.last_result = {
                         "label": "Silence",
@@ -185,65 +333,200 @@ class AudioDetector:
                         "timestamp": timestamp,
                         "inference_latency_ms": 0.0,
                     }
+
                 self._set_health("OK")
+
                 continue
 
+            # --------------------------------------------------------
+            # Actual AST inference
+            # --------------------------------------------------------
             try:
-                self._run_inference(audio, peak, rms)
+                self._run_inference(
+                    audio,
+                    peak,
+                    rms,
+                )
+
             except Exception as exc:
-                message = f"AST inference failed: {exc}"
-                logger.error(message, exc_info=True)
-                self._set_health("ERROR", message)
+                message = (
+                    f"AST inference failed: {exc}"
+                )
+
+                logger.error(
+                    message,
+                    exc_info=True,
+                )
+
+                self._set_health(
+                    "ERROR",
+                    message,
+                )
+
                 with self.lock:
                     self.last_result = {
                         **self._create_empty_result(),
                         "timestamp": None,
                     }
 
-    def _run_inference(self, audio: np.ndarray, peak: float, rms: float) -> None:
+    # =================================================================
+    # AST inference
+    # =================================================================
+
+    def _run_inference(
+        self,
+        audio: np.ndarray,
+        peak: float,
+        rms: float,
+    ) -> None:
         start = time.perf_counter()
+
+        # ------------------------------------------------------------
+        # Processor converts numpy audio -> PyTorch tensors
+        # ------------------------------------------------------------
         inputs = self.processor(
             audio,
             sampling_rate=self.config.SAMPLE_RATE,
             return_tensors="pt",
         )
-        inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
-        with torch.no_grad():
+        # ------------------------------------------------------------
+        # Move every tensor to same device as AST model
+        # ------------------------------------------------------------
+        inputs = {
+            key: value.to(self.device)
+            for key, value in inputs.items()
+        }
+
+        # ------------------------------------------------------------
+        # Model inference
+        # ------------------------------------------------------------
+        with torch.inference_mode():
             outputs = self.model(**inputs)
 
-        probabilities = torch.softmax(outputs.logits, dim=-1)[0]
-        k = min(10, probabilities.shape[0])
-        top_values, top_indices = torch.topk(probabilities, k=k)
+        # ------------------------------------------------------------
+        # Convert logits -> probabilities
+        # ------------------------------------------------------------
+        probabilities = torch.softmax(
+            outputs.logits,
+            dim=-1,
+        )[0]
 
-        top_predictions: List[Tuple[str, float]] = []
-        for probability, index in zip(top_values, top_indices):
+        # ------------------------------------------------------------
+        # Top-k predictions
+        # ------------------------------------------------------------
+        k = min(
+            10,
+            probabilities.shape[0],
+        )
+
+        top_values, top_indices = torch.topk(
+            probabilities,
+            k=k,
+        )
+
+        top_predictions: List[
+            Tuple[str, float]
+        ] = []
+
+        for probability, index in zip(
+            top_values,
+            top_indices,
+        ):
             class_id = int(index)
-            label = self.model.config.id2label[class_id]
-            top_predictions.append((label, float(probability)))
 
-        threat_predictions: List[Tuple[str, float, float, float]] = []
+            label = self.model.config.id2label[
+                class_id
+            ]
+
+            top_predictions.append(
+                (
+                    label,
+                    float(probability),
+                )
+            )
+
+        # ------------------------------------------------------------
+        # Threat scoring
+        # ------------------------------------------------------------
+        threat_predictions: List[
+            Tuple[str, float, float, float]
+        ] = []
+
         weighted_scores: List[float] = []
+
         for label, confidence in top_predictions:
-            weight = self.config.THREAT_CLASSES.get(label)
+            weight = self.config.THREAT_CLASSES.get(
+                label
+            )
+
             if weight is None:
                 continue
-            weighted_score = confidence * weight
-            threat_predictions.append((label, confidence, weight, weighted_score))
-            weighted_scores.append(weighted_score)
 
-        threat_score = min(sum(weighted_scores), 1.0)
-        if threat_score >= self.config.THREAT_SCORE_THREATENING:
+            weighted_score = (
+                confidence * weight
+            )
+
+            threat_predictions.append(
+                (
+                    label,
+                    confidence,
+                    weight,
+                    weighted_score,
+                )
+            )
+
+            weighted_scores.append(
+                weighted_score
+            )
+
+        threat_score = min(
+            sum(weighted_scores),
+            1.0,
+        )
+
+        # ------------------------------------------------------------
+        # Risk classification
+        # ------------------------------------------------------------
+        if (
+            threat_score
+            >= self.config.THREAT_SCORE_THREATENING
+        ):
             risk_label = "THREATENING"
-        elif threat_score >= self.config.THREAT_SCORE_SUSPICIOUS:
+
+        elif (
+            threat_score
+            >= self.config.THREAT_SCORE_SUSPICIOUS
+        ):
             risk_label = "SUSPICIOUS"
+
         else:
             risk_label = "BENIGN"
 
-        label, confidence = top_predictions[0] if top_predictions else ("Unknown", 0.0)
-        latency_ms = (time.perf_counter() - start) * 1000.0
+        # ------------------------------------------------------------
+        # Primary prediction
+        # ------------------------------------------------------------
+        label, confidence = (
+            top_predictions[0]
+            if top_predictions
+            else ("Unknown", 0.0)
+        )
+
+        # ------------------------------------------------------------
+        # GPU synchronization for accurate CUDA timing
+        # ------------------------------------------------------------
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
+        latency_ms = (
+            time.perf_counter() - start
+        ) * 1000.0
+
         timestamp = time.time()
 
+        # ------------------------------------------------------------
+        # Store result atomically
+        # ------------------------------------------------------------
         with self.lock:
             self.last_result = {
                 "label": label,
@@ -259,7 +542,12 @@ class AudioDetector:
             }
 
         self.last_inference_ms = latency_ms
+
         self._set_health("OK")
+
+    # =================================================================
+    # Public API
+    # =================================================================
 
     def get_result(self) -> Dict[str, Any]:
         with self.lock:
@@ -271,27 +559,56 @@ class AudioDetector:
                 "status": self.health_status,
                 "last_error": self.last_error,
                 "last_inference_ms": self.last_inference_ms,
+                "device": str(self.device),
             }
 
     def get_audio_buffer(self) -> np.ndarray:
-        """Return a copy of the current 2-second rolling audio buffer."""
+        """Return a copy of the current 2-second rolling buffer."""
         with self.lock:
             return self.audio_buffer.copy()
 
     def save_audio_buffer(self, path: str) -> None:
         """Save the current 2-second rolling buffer as a WAV file."""
         audio = self.get_audio_buffer()
-        sf.write(path, audio, self.config.SAMPLE_RATE)
+
+        sf.write(
+            path,
+            audio,
+            self.config.SAMPLE_RATE,
+        )
+
+    # =================================================================
+    # Shutdown
+    # =================================================================
 
     def stop(self) -> None:
         self.running = False
-        stream = getattr(self, "stream", None)
+
+        stream = getattr(
+            self,
+            "stream",
+            None,
+        )
+
         if stream is not None:
             try:
                 stream.stop()
                 stream.close()
+
             except Exception as exc:
-                logger.error("Error closing stream: %s", exc, exc_info=True)
-        thread = getattr(self, "thread", None)
-        if thread is not None and thread.is_alive():
+                logger.error(
+                    "Error closing stream: %s",
+                    exc,
+                )
+
+        thread = getattr(
+            self,
+            "thread",
+            None,
+        )
+
+        if (
+            thread is not None
+            and thread.is_alive()
+        ):
             thread.join(timeout=2.0)
