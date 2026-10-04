@@ -56,3 +56,12 @@ SentinelVision_Stabilization_Patch/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local research artifacts
+research/
+research_data/
+*.pdf
+*.txt
+benchmark_output/
+benchmark_outputs/
+Yolo-Weapon-Detection-2/
